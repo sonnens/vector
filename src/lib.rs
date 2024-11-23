@@ -80,9 +80,6 @@ pub(crate) mod graph;
 pub mod heartbeat;
 pub mod http;
 #[allow(unreachable_pub)]
-#[cfg(any(feature = "sources-kafka", feature = "sinks-kafka"))]
-pub mod kafka;
-#[allow(unreachable_pub)]
 pub mod kubernetes;
 pub mod line_agg;
 pub mod list;

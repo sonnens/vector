@@ -30,7 +30,20 @@ use crate::{
 use vector_lib::shutdown::ShutdownSignal;
 use vector_lib::{config::proxy::ProxyConfig, event::Event, EstimatedJsonEncodedSizeOf};
 
+pub(crate) trait HttpClientInputs {
+    fn urls(&self) -> Vec<Uri>;
+    fn interval(&self) -> &Duration;
+    fn timeout(&self) -> &Duration;
+    fn headers(&self) -> &HashMap<String, Vec<String>>;
+    fn content_type(&self) -> &String;
+    fn auth(&self) -> &Option<Auth>;
+    fn tls(&self) -> &TlsSettings;
+    fn proxy(&self) -> &ProxyConfig;
+    fn shutdown(&self) -> &ShutdownSignal;
+}
+
 /// Contains the inputs generic to any http client.
+#[derive(Clone)]
 pub(crate) struct GenericHttpClientInputs {
     /// Array of URLs to call.
     pub urls: Vec<Uri>,
@@ -46,6 +59,44 @@ pub(crate) struct GenericHttpClientInputs {
     pub tls: TlsSettings,
     pub proxy: ProxyConfig,
     pub shutdown: ShutdownSignal,
+}
+
+impl HttpClientInputs for GenericHttpClientInputs {
+    fn urls(&self) -> Vec<Uri> {
+        self.urls.clone()
+    }
+
+    fn interval(&self) -> &Duration {
+        &self.interval
+    }
+
+    fn timeout(&self) -> &Duration {
+        &self.timeout
+    }
+
+    fn headers(&self) -> &HashMap<String, Vec<String>> {
+        &self.headers
+    }
+
+    fn content_type(&self) -> &String {
+        &self.content_type
+    }
+
+    fn auth(&self) -> &Option<Auth> {
+        &self.auth
+    }
+
+    fn tls(&self) -> &TlsSettings {
+        &self.tls
+    }
+
+    fn proxy(&self) -> &ProxyConfig {
+        &self.proxy
+    }
+
+    fn shutdown(&self) -> &ShutdownSignal {
+        &self.shutdown
+    }
 }
 
 /// The default interval to call the HTTP endpoint if none is configured.
@@ -124,23 +175,27 @@ pub(crate) fn warn_if_interval_too_low(timeout: Duration, interval: Duration) {
 ///   - The HTTP response is decoded/parsed into events by the specific context.
 ///   - The events are then sent to the output stream.
 pub(crate) async fn call<
-    B: HttpClientBuilder<Context = C> + Send + Clone,
+    B: HttpClientBuilder<Context = C> + Send + Sync + Clone,
     C: HttpClientContext + Send,
+    I: HttpClientInputs + Send + Sync,
 >(
-    inputs: GenericHttpClientInputs,
+    inputs: I,
     context_builder: B,
     mut out: SourceSender,
     http_method: HttpMethod,
 ) -> Result<(), ()> {
     // Building the HttpClient should not fail as it is just setting up the client with the
     // proxy and tls settings.
+    let inputs = std::sync::Arc::new(inputs);
     let client =
-        HttpClient::new(inputs.tls.clone(), &inputs.proxy).expect("Building HTTP client failed");
-    let mut stream = IntervalStream::new(tokio::time::interval(inputs.interval))
-        .take_until(inputs.shutdown)
-        .map(move |_| stream::iter(inputs.urls.clone()))
+        HttpClient::new(inputs.tls().clone(), &inputs.proxy()).expect("Building HTTP client failed");
+    let mut stream = IntervalStream::new(tokio::time::interval(*inputs.interval()))
+        .take_until(inputs.shutdown().clone())
+        .map(|_| inputs.urls())
+        .map(move |urls| stream::iter(urls))
         .flatten()
-        .map(move |url| {
+        .map(|url| {
+            let inputs = inputs.clone();
             let client = client.clone();
             let endpoint = url.to_string();
 
@@ -157,33 +212,35 @@ pub(crate) async fn call<
                 HttpMethod::Options => Request::options(&url),
             };
 
+            let headers = inputs.headers();
             // add user specified headers
-            for (header, values) in &inputs.headers {
+            for (header, values) in headers.iter() {
                 for value in values {
-                    builder = builder.header(header, value);
+                    builder = builder.header(header.clone(), value);
                 }
             }
 
             // set ACCEPT header if not user specified
-            if !inputs.headers.contains_key(http::header::ACCEPT.as_str()) {
-                builder = builder.header(http::header::ACCEPT, &inputs.content_type);
+            if !inputs.headers().contains_key(http::header::ACCEPT.as_str()) {
+                builder = builder.header(http::header::ACCEPT, inputs.content_type().as_str());
             }
 
             // building an empty request should be infallible
             let mut request = builder.body(Body::empty()).expect("error creating request");
 
-            if let Some(auth) = &inputs.auth {
+            if let Some(auth) = inputs.auth() {
                 auth.apply(&mut request);
             }
+            let timeout = *inputs.timeout();
 
-            tokio::time::timeout(inputs.timeout, client.send(request))
+            tokio::time::timeout(timeout, client.send(request))
                 .then(move |result| async move {
                     match result {
                         Ok(Ok(response)) => Ok(response),
                         Ok(Err(error)) => Err(error.into()),
                         Err(_) => Err(format!(
                             "Timeout error: request exceeded {}s",
-                            inputs.timeout.as_secs_f64()
+                            timeout.as_secs_f64()
                         )
                         .into()),
                     }
