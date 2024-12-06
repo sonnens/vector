@@ -1,10 +1,13 @@
-use crate::codecs::DecodingConfig;
+use crate::codecs::{DecodingConfig, Decoder};
+use tokio_util::codec::Decoder as _;
 use crate::sources::util::http::HttpMethod;
+use vector_lib::schema::Definition;
+use vrl::value::Kind;
+use crate::vector_lib::event::EventContainer;
 use crate::sources::util::http_client::default_timeout;
 use crate::{
     config::{GenerateConfig, SourceConfig, SourceContext, SourceOutput},
     http::Auth,
-    serde::{default_decoding, default_framing_message_based},
     sources::{
         self,
         util::http_client::{
@@ -15,7 +18,12 @@ use crate::{
     tls::TlsSettings,
     Result,
 };
-use bytes::Bytes;
+use vector_lib::lookup::owned_value_path;
+
+use vector_lib::codecs::{
+    BytesDecoderConfig, JsonDeserializerConfig
+};
+use bytes::{Bytes, BytesMut};
 use futures_util::FutureExt;
 use http::{response::Parts, Uri};
 use serde_with::serde_as;
@@ -44,10 +52,6 @@ fn find_rel_next_link(header: &str) -> Option<Uri> {
     next
 }
 
-fn default_start_from_secs_ago() -> u64 {
-    0
-}
-
 /// Configuration for the `okta_log` source.
 #[serde_as]
 #[configurable_component(source("okta_log", "Collect Okta System Logs."))]
@@ -68,13 +72,14 @@ pub struct OktaLogPollConfig {
 
     /// The start time for the first fetch.
     /// This is a duration in seconds from the current time.
-    #[serde(default = "default_start_from_secs_ago")]
+    #[serde(default)]
     #[configurable(metadata(docs::examples = "3600", default = "0"))]
     start_from_secs_ago: u64,
 
     #[configurable(derived)]
-    #[configurable(metadata(docs::advanced))]
+    #[configurable(metadata(docs::human_name = "API Token"))]
     token: String,
+
 }
 
 impl GenerateConfig for OktaLogPollConfig {
@@ -97,7 +102,7 @@ struct CheckpointHttpClientInput {
     content_type: String,
     tls: TlsSettings,
     proxy: vector_lib::config::proxy::ProxyConfig,
-    shutdown: ShutdownSignal,
+    shutdown: ShutdownSignal
 }
 
 impl HttpClientInputs for CheckpointHttpClientInput {
@@ -144,17 +149,32 @@ impl HttpClientInputs for CheckpointHttpClientInput {
 }
 
 impl OktaLogPollConfig {
-    pub fn get_decoding_config(&self) -> DecodingConfig {
-        let decoding = default_decoding();
-        let framing = default_framing_message_based();
-        DecodingConfig::new(framing, decoding, false.into())
+    pub fn get_decoding_config(&self, log_namespace: LogNamespace) -> DecodingConfig {
+        DecodingConfig::new(
+            BytesDecoderConfig::new().into(),
+            JsonDeserializerConfig::default().into(),
+            log_namespace,
+        )
+    }
+    pub fn get_schema_definition(&self, decoding: DecodingConfig, log_namespace: LogNamespace) -> Definition {
+        decoding.config()
+        .schema_definition(log_namespace)
+        .with_source_metadata(
+            Self::NAME,
+            None,
+            &owned_value_path!("domain"),
+            Kind::bytes(),
+            None,
+        )
+        .with_standard_vector_source_metadata()
     }
 }
 
 #[async_trait::async_trait]
-#[typetag::serde(name = "okta_log")]
+#[typetag::serde(name = "okta_logs")]
 impl SourceConfig for OktaLogPollConfig {
     async fn build(&self, cx: SourceContext) -> Result<sources::Source> {
+        let log_namespace = cx.log_namespace(None);
         let ts = chrono::Utc::now().timestamp() as u64 - self.start_from_secs_ago;
         let ts = chrono::DateTime::from_timestamp(ts as i64, 0)
             .unwrap()
@@ -171,6 +191,7 @@ impl SourceConfig for OktaLogPollConfig {
 
         let builder = OktaLogPollBuilder {
             checkpoint_url: url.clone(),
+            decoder: self.get_decoding_config(log_namespace).build()?,
         };
 
         let inputs = CheckpointHttpClientInput {
@@ -193,14 +214,11 @@ impl SourceConfig for OktaLogPollConfig {
         Ok(call(inputs, builder, cx.out, HttpMethod::Get).boxed())
     }
 
-    fn outputs(&self, global_log_namespace: LogNamespace) -> Vec<SourceOutput> {
-        let schema_definition = default_decoding()
-            .schema_definition(global_log_namespace)
-            .with_standard_vector_source_metadata();
-
+    fn outputs(&self, log_namespace: LogNamespace) -> Vec<SourceOutput> {
+        let decoding = self.get_decoding_config(log_namespace);
         vec![SourceOutput::new_maybe_logs(
-            default_decoding().output_type(),
-            schema_definition,
+            decoding.config().output_type(),
+            self.get_schema_definition(decoding, log_namespace),
         )]
     }
 
@@ -212,6 +230,7 @@ impl SourceConfig for OktaLogPollConfig {
 #[derive(Clone)]
 struct OktaLogPollBuilder {
     checkpoint_url: Arc<RwLock<Uri>>,
+    decoder: Decoder,
 }
 
 impl HttpClientBuilder for OktaLogPollBuilder {
@@ -220,49 +239,46 @@ impl HttpClientBuilder for OktaLogPollBuilder {
     fn build(&self, _: &Uri) -> Self::Context {
         OktaLogPollContext {
             checkpoint: self.checkpoint_url.clone(),
+            decoder: self.decoder.clone(),
         }
     }
 }
 
 struct OktaLogPollContext {
     checkpoint: std::sync::Arc<std::sync::RwLock<Uri>>,
+    decoder: Decoder,
 }
 
 impl OktaLogPollContext {
-    fn decode_events(&mut self, buf: &Bytes) -> Vec<Event> {
-        let mut events = Vec::new();
-        let value = serde_json::from_slice::<serde_json::Value>(buf).unwrap();
-        match value {
-            serde_json::Value::Array(arr) => {
-                for v in arr {
-                    events.push(Event::from_json_value(v, LogNamespace::Legacy).unwrap());
-                }
-            }
-            _ => { events.push(Event::from_json_value(value, LogNamespace::Legacy).unwrap()); }
+    fn decode_events(&mut self, buf: &mut BytesMut) -> Vec<Event> {
+        if let Ok(Some(items)) = self.decoder.decode_eof(buf) {
+            items.0.into_iter().map(|event| {
+                event.into_events().collect::<Vec<_>>()
+            }).flatten().collect::<Vec<_>>()
+        } else {
+            Vec::new()
         }
-        events
     }
+
 }
 
 impl HttpClientContext for OktaLogPollContext {
     fn enrich_events(&mut self, events: &mut Vec<Event>) {
         let now = chrono::Utc::now();
         for event in events {
-            match event {
-                Event::Log(ref mut log) => {
-                    LogNamespace::Legacy.insert_standard_vector_source_metadata(
-                        log,
-                        OktaLogPollConfig::NAME,
-                        now,
-                    );
-                }
-                _ => {}
-            }
+            let log = event.as_mut_log();
+
+            log.namespace().insert_standard_vector_source_metadata(log, OktaLogPollConfig::NAME, now);
         }
     }
 
     fn on_response(&mut self, _: &Uri, headers: &Parts, body: &Bytes) -> Option<Vec<Event>> {
-        let events = self.decode_events(&body);
+
+        let mut buf = BytesMut::new();
+
+        buf.extend_from_slice(body);
+
+        let events = self.decode_events(&mut buf);
 
         if events.len() > 0 {
             headers
@@ -285,13 +301,4 @@ impl HttpClientContext for OktaLogPollContext {
         }
     }
 
-    fn on_http_response_error(&self, url: &Uri, header: &Parts) {
-        if header.status == hyper::StatusCode::NOT_FOUND && url.path() == "/" {
-            // https://github.com/vectordotdev/vector/pull/3801#issuecomment-700723178
-            warn!(
-                message = "I dunno",
-                endpoint = %url,
-            );
-        }
-    }
 }

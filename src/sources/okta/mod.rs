@@ -1,5 +1,5 @@
-//#[cfg(feature = "sources-okta_log")]
-mod okta_log;
+#[cfg(feature = "sources-okta_logs")]
+mod okta_logs;
 
-//#[cfg(feature = "sources-okta_log")]
-pub use okta_log::OktaLogPollConfig;
+#[cfg(feature = "sources-okta_logs")]
+pub use okta_logs::OktaLogPollConfig;

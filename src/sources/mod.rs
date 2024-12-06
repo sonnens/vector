@@ -50,8 +50,8 @@ pub mod internal_logs;
 pub mod internal_metrics;
 #[cfg(all(unix, feature = "sources-journald"))]
 pub mod journald;
-// # [ c f g ( f e  at u r e = "sources-kafka")]
-//pub mod kafka;
+#[cfg(feature = "sources-kafka")]
+pub mod kafka;
 #[cfg(feature = "sources-kubernetes_logs")]
 pub mod kubernetes_logs;
 #[cfg(feature = "sources-logstash")]
@@ -62,7 +62,7 @@ pub mod mongodb_metrics;
 pub mod nats;
 #[cfg(feature = "sources-nginx_metrics")]
 pub mod nginx_metrics;
-// # [ c f g (feature = "sources-okta_logs")]
+#[cfg(feature = "sources-okta_logs")]
 pub mod okta;
 #[cfg(feature = "sources-opentelemetry")]
 pub mod opentelemetry;
