@@ -72,9 +72,8 @@ mod influxdb;
 mod internal_logs;
 #[cfg(all(unix, feature = "sources-journald"))]
 mod journald;
-/* #[cfg(any(feature = "sources-kafka", feature = "sinks-kafka"))]
+#[cfg(any(feature = "sources-kafka", feature = "sinks-kafka"))]
 mod kafka;
-*/
 #[cfg(feature = "sources-kubernetes_logs")]
 mod kubernetes_logs;
 #[cfg(feature = "transforms-log_to_metric")]
