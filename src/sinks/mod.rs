@@ -5,6 +5,7 @@ use snafu::Snafu;
 pub mod prelude;
 pub mod util;
 
+pub mod exec;
 #[cfg(feature = "sinks-amqp")]
 pub mod amqp;
 #[cfg(feature = "sinks-appsignal")]
