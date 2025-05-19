@@ -4,8 +4,9 @@ use crate::{
     sinks::prelude::*,
 };
 use bytes::BytesMut;
+use futures::TryFutureExt;
 use serde_with::serde_as;
-use std::{collections::HashMap, path::PathBuf, sync::Arc}; //, time::Duration};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::{io::AsyncWriteExt, process::Command, sync::Mutex};
 use tokio_util::codec::Encoder as _;
 use vector_lib::codecs::{
@@ -14,7 +15,6 @@ use vector_lib::codecs::{
 };
 
 use std::process::Stdio;
-//use vector_lib::internal_event::{EventsSent, Output, Registered};
 
 /// Mode of operation for running the command.
 #[configurable_component]
@@ -39,11 +39,14 @@ pub enum OnceMode {
     Pipe,
 }
 
-const fn default_once_mode() -> OnceMode {
-    OnceMode::Argument
+impl Default for OnceMode {
+    fn default() -> Self {
+        OnceMode::Argument
+    }
 }
-const fn default_exec_timeout_secs() -> u64 {
-    60
+
+const fn default_exec_timeout_milliseconds() -> u64 {
+    5
 }
 const fn default_respawn_on_exit() -> bool {
     false
@@ -51,6 +54,11 @@ const fn default_respawn_on_exit() -> bool {
 const fn default_respawn_interval_secs() -> u64 {
     5
 }
+
+const fn default_max_concurrent_processes() -> u64 {
+    1
+}
+
 const fn default_clear_environment() -> bool {
     false
 }
@@ -69,15 +77,33 @@ fn environment_examples() -> HashMap<String, String> {
 #[serde(deny_unknown_fields)]
 pub struct OnceConfig {
     /// the mode of operation for the command.
-    #[serde(default = "default_once_mode")]
+    #[serde(default)]
     #[configurable(metadata(docs::human_name = "Mode"))]
     mode: OnceMode,
+
     /// The maximum amount of time, in seconds, to wait for the command to finish.
     ///
     /// If the command takes longer than `exec_timeout_secs` to run, it is killed.
-    #[serde(default = "default_exec_timeout_secs")]
+    #[serde(default = "default_exec_timeout_milliseconds")]
     #[configurable(metadata(docs::human_name = "Timeout"))]
-    exec_timeout_secs: u64,
+    exec_timeout_milliseconds: u64,
+
+    /// The maximum number of processes to spawn.
+    ///
+    /// each event will spawn a new process, up to this limit.
+    #[serde(default = "default_max_concurrent_processes")]
+    #[configurable(metadata(docs::human_name = "Max Processes"))]
+    max_concurrent_processes: u64,
+}
+
+impl Default for OnceConfig {
+    fn default() -> Self {
+        Self {
+            exec_timeout_milliseconds: default_exec_timeout_milliseconds(),
+            max_concurrent_processes: default_max_concurrent_processes(),
+            mode: OnceMode::default(),
+        }
+    }
 }
 
 /// Configuration options for streaming commands.
@@ -151,10 +177,7 @@ impl GenerateConfig for ExecSinkConfig {
         toml::Value::try_from(Self {
             command: Default::default(),
             mode: Mode::Once,
-            once: Some(OnceConfig {
-                mode: OnceMode::Argument,
-                exec_timeout_secs: default_exec_timeout_secs(),
-            }),
+            once: None,
             streaming: None,
             working_directory: None,
             environment: None,
@@ -198,9 +221,10 @@ pub struct ExecSink {
     environment: Option<HashMap<String, String>>,
     clear_environment: bool,
     mode: Mode,
-    once_config: Option<OnceConfig>,
-    //streaming_config: Option<StreamingConfig>,
-    //events_sent: Registered<EventsSent>,
+    once_config: OnceConfig,
+    child_semaphore: Arc<tokio::sync::Semaphore>,
+    #[allow(dead_code)]
+    streaming_config: StreamingConfig,
 }
 
 impl ExecSink {
@@ -217,9 +241,14 @@ impl ExecSink {
             environment: config.environment.clone(),
             clear_environment: config.clear_environment,
             mode: config.mode,
-            once_config: config.once.clone(),
-            //streaming_config: config.streaming.clone(),
-            //events_sent: register!(EventsSent::from(Output(None))),
+            child_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                config
+                    .once
+                    .as_ref()
+                    .map_or(1, |c| c.max_concurrent_processes as usize),
+            )),
+            once_config: config.once.clone().unwrap_or_default(),
+            streaming_config: config.streaming.clone().unwrap_or_default(),
         })
     }
 
@@ -248,82 +277,68 @@ impl ExecSink {
     }
 
     async fn run_once(&mut self, mut event: Event) -> Result<(), ()> {
-        let config = self.once_config.as_ref().expect("once config must be set");
+        let mut encoded = BytesMut::new();
+        self.transformer.transform(&mut event);
+        self.encoder.encode(event, &mut encoded).unwrap();
 
-        match config.mode {
+        let mut cmd = match self.once_config.mode {
             OnceMode::Argument => {
-                let mut encoded = BytesMut::new();
-                self.transformer.transform(&mut event);
-                self.encoder.encode(event.clone(), &mut encoded).unwrap();
-
                 let mut cmd = self.build_command();
                 cmd.arg(String::from_utf8_lossy(&encoded).to_string());
-                cmd.stdout(Stdio::null());
-                cmd.stderr(Stdio::null());
-
-                let status = cmd.status().await.map_err(|e| {
-                    emit!(ExecFailedError {
-                        command: self.command.join(" ").as_str(),
-                        error: e,
-                    });
-                })?;
-
-                if status.success() {
-                    let finalizers = event.take_finalizers();
-                    finalizers.update_status(EventStatus::Delivered);
-                    Ok(())
-                } else {
-                    event.metadata().update_status(EventStatus::Errored);
-                    Err(())
-                }
+                cmd.stdin(Stdio::null());
+                cmd
             }
             OnceMode::Pipe => {
                 let mut cmd = self.build_command();
                 cmd.stdin(Stdio::piped());
-                cmd.stdout(Stdio::null());
-                cmd.stderr(Stdio::null());
+                cmd
+            }
+        };
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
 
-                let mut child = cmd.spawn().map_err(|e| {
-                    emit!(ExecFailedError {
-                        command: self.command.join(" ").as_str(),
-                        error: e,
-                    });
-                })?;
+        let mut child = cmd.spawn().map_err(|e| {
+            emit!(ExecFailedError {
+                command: self.command.join(" ").as_str(),
+                error: e,
+            });
+        })?;
 
-                let stdin = child.stdin.as_mut().expect("Failed to get stdin");
+        if let OnceMode::Pipe = self.once_config.mode {
+            let stdin = child.stdin.as_mut().ok_or_else(|| {
+                emit!(ExecFailedError {
+                    command: self.command.join(" ").as_str(),
+                    error: std::io::Error::new(std::io::ErrorKind::Other, "Failed to get stdin",),
+                });
+            })?;
 
-                let mut encoded = BytesMut::new();
-                self.transformer.transform(&mut event);
-                self.encoder.encode(event.clone(), &mut encoded).unwrap();
+            stdin.write_all(&encoded).await.map_err(|e| {
+                emit!(ExecFailedError {
+                    command: self.command.join(" ").as_str(),
+                    error: e,
+                });
+            })?;
+        }
 
-                tokio::io::AsyncWriteExt::write_all(stdin, &encoded)
-                    .await
-                    .map_err(|e| {
-                        emit!(ExecFailedError {
-                            command: self.command.join(" ").as_str(),
-                            error: e,
-                        });
-                    })?;
-
-                //drop(stdin); // Close stdin to signal EOF
-
-                let status = child.wait().await.map_err(|e| {
-                    emit!(ExecFailedError {
-                        command: self.command.join(" ").as_str(),
-                        error: e,
-                    });
-                })?;
-
-                if status.success() {
-                    let finalizers = event.take_finalizers();
-                    finalizers.update_status(EventStatus::Delivered);
+        cmd.status()
+            .await
+            .and_then(|r| {
+                if r.success() {
                     Ok(())
                 } else {
-                    event.metadata().update_status(EventStatus::Errored);
-                    Err(())
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "command failed",
+                    ))
                 }
-            }
-        }
+            })
+            .map_err(|e| {
+                emit!(ExecFailedError {
+                    command: self.command.join(" ").as_str(),
+                    error: e,
+                });
+            })?;
+        Ok(())
     }
 
     async fn run_streaming(&mut self, input: BoxStream<'_, Event>) -> Result<(), ()> {
@@ -332,53 +347,58 @@ impl ExecSink {
         cmd.stdout(Stdio::null());
         cmd.stderr(Stdio::null());
 
-        let child = cmd
+        let mut child = cmd
             .spawn()
             .map_err(|e| {
                 emit!(ExecFailedError {
                     command: self.command.join(" ").as_str(),
                     error: e,
                 });
-            })
-            .expect("Failed to spawn command");
+            })?;
 
-        let stdin = Arc::new(Mutex::new(child.stdin.expect("Failed to get stdin")));
-
+        let stdin = Arc::new(Mutex::new(child.stdin.take().ok_or_else(|| {})?));
         let transformer = self.transformer.clone();
 
-        let command = self.command.join(" ").to_string();
+        let command = Arc::new(self.command.join(" ").to_string());
 
         input
-            .for_each(|event| {
-                let command = command.clone();
-                let mut encoder = self.encoder.clone();
-                let transformer = transformer.clone();
-                let stdin = stdin.clone();
-                async move {
-                    let mut event = event;
-                    let mut stdin = stdin.lock().await;
+        .take_while(|_| async { child.id().is_some() })
+        .for_each(|mut event| {
+            let stdin = stdin.clone();
+            let command = command.clone();
 
-                    transformer.transform(&mut event);
-                    let mut encoded = BytesMut::new();
-                    encoder.encode(event.clone(), &mut encoded).unwrap();
+            let finalizers = event.take_finalizers();
 
-                    if stdin.write_all(&encoded).await.is_err() {
-                        emit!(ExecFailedError {
-                            command: command.as_str(),
-                            error: std::io::Error::new(std::io::ErrorKind::Other, "write error"),
-                        });
-                        event.metadata().update_status(EventStatus::Errored);
-                        return;
-                    }
+            transformer.transform(&mut event);
+            let mut encoded = BytesMut::new();
+            let encode_result = self.encoder.encode(event, &mut encoded).map_err(|e| {
+                emit!(ExecFailedError {
+                    command: command.as_str(),
+                    error: std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Failed to encode event: {}", e),
+                    ),
+                });
+                finalizers.update_status(EventStatus::Errored);
+            });
 
-                    let finalizers = event.take_finalizers();
-                    finalizers.update_status(EventStatus::Delivered);
+            async move {
+                if let Err(_) = encode_result {
+                    return;
                 }
-            })
-            .await;
-
-        drop(stdin);
-
+                let mut stdin = stdin.lock().await;
+                if let Err(e) = stdin.write_all(&encoded).await.map(|_| {
+                    finalizers.update_status(EventStatus::Delivered);
+                }) {
+                    emit!(ExecFailedError {
+                        command: command.as_str(),
+                        error: e.into(),
+                    });
+                    finalizers.update_status(EventStatus::Errored);
+                };
+            }
+        })
+        .await;
         Ok(())
     }
 }
@@ -388,8 +408,46 @@ impl StreamSink<Event> for ExecSink {
     async fn run(mut self: Box<Self>, mut input: BoxStream<'_, Event>) -> Result<(), ()> {
         match self.mode {
             Mode::Once => {
-                while let Some(event) = input.next().await {
-                    self.run_once(event).await?;
+                let sem = self.child_semaphore.clone();
+                let timeout =
+                    std::time::Duration::from_millis(self.once_config.exec_timeout_milliseconds);
+                while let Some(mut event) = input.next().await {
+                    let finalizers = event.take_finalizers();
+                    let command = self.command.join(" ").clone();
+                    match tokio::time::timeout(
+                        timeout.clone(),
+                        sem.acquire()
+                            .map_ok(|_| self.run_once(event))
+                            .map_err(|e| {
+                                emit!(ExecFailedError {
+                                    command: command.as_str(),
+                                    error: std::io::Error::new(
+                                        std::io::ErrorKind::ResourceBusy,
+                                        e.to_string()
+                                    ),
+                                });
+                            })
+                            .await?,
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {
+                            finalizers.update_status(EventStatus::Delivered);
+                        }
+                        Ok(Err(_)) => {
+                            finalizers.update_status(EventStatus::Errored);
+                        }
+                        Err(e) => {
+                            emit!(ExecFailedError {
+                                command: command.as_str(),
+                                error: std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    format!("Command timed out: {}", e),
+                                ),
+                            });
+                            finalizers.update_status(EventStatus::Errored);
+                        }
+                    }
                 }
                 Ok(())
             }
