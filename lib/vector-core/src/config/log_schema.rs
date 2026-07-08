@@ -11,6 +11,7 @@ const TIMESTAMP: &str = "timestamp";
 const HOST: &str = "host";
 const SOURCE_TYPE: &str = "source_type";
 const METADATA: &str = "metadata";
+const SOURCE_EVENT_ID: &str = "source_event_id";
 
 /// Loads Log Schema from configurations and sets global schema. Once this is
 /// done, configurations can be correctly loaded using configured log schema
@@ -69,6 +70,12 @@ pub struct LogSchema {
     #[serde(default = "LogSchema::default_source_type_key")]
     source_type_key: OptionalTargetPath,
 
+    /// The name of the event field to set the source event id in.
+    ///
+    /// This field will be set by the Vector source that the event was created in.
+    #[serde(default = "LogSchema::default_source_event_id_key")]
+    source_event_id_key: OptionalTargetPath,
+
     /// The name of the event field to set the event metadata in.
     ///
     /// Generally, this field will be set by Vector to hold event-specific metadata, such as
@@ -84,6 +91,7 @@ impl Default for LogSchema {
             timestamp_key: Self::default_timestamp_key(),
             host_key: Self::default_host_key(),
             source_type_key: Self::default_source_type_key(),
+            source_event_id_key: Self::default_source_event_id_key(),
             metadata_key: Self::default_metadata_key(),
         }
     }
@@ -104,6 +112,10 @@ impl LogSchema {
 
     fn default_source_type_key() -> OptionalTargetPath {
         OptionalTargetPath::event(SOURCE_TYPE)
+    }
+
+    fn default_source_event_id_key() -> OptionalTargetPath {
+        OptionalTargetPath::event(SOURCE_EVENT_ID)
     }
 
     fn default_metadata_key() -> OptionalTargetPath {
@@ -145,6 +157,10 @@ impl LogSchema {
 
     pub fn metadata_key(&self) -> Option<&OwnedValuePath> {
         self.metadata_key.as_ref().map(|key| &key.path)
+    }
+
+    pub fn source_event_id_key(&self) -> Option<&OwnedValuePath> {
+        self.source_event_id_key.as_ref().map(|key| &key.path)
     }
 
     pub fn message_key_target_path(&self) -> Option<&OwnedTargetPath> {

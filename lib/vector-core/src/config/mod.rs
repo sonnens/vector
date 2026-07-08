@@ -489,8 +489,8 @@ impl LogNamespace {
     /// Vector: The `ingest_timestamp`, and `source_type` fields are added to "event metadata", nested
     /// under the name "vector". This data will be marked as read-only in VRL.
     ///
-    /// Legacy: The values of `source_type_key`, and `timestamp_key` are stored as keys on the event root,
-    /// only if a field with that name doesn't already exist.
+    /// Legacy: The values of `source_type_key`, `source_event_id_key` and `timestamp_key` are stored as
+    /// keys on the event root, only if a field with that name doesn't already exist.
     pub fn insert_standard_vector_source_metadata(
         &self,
         log: &mut LogEvent,
@@ -509,6 +509,14 @@ impl LogNamespace {
             path!("ingest_timestamp"),
             now,
         );
+        if let Some(event_id) = log.metadata().source_event_id() {
+            self.insert_vector_metadata(
+                log,
+                log_schema().source_event_id_key(),
+                path!("source_event_id"),
+                event_id.to_string(),
+            );
+        }
     }
 
     /// Vector: This is added to the "event metadata", nested under the name "vector". This data
