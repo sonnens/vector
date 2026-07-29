@@ -41,6 +41,122 @@ generated: components: sinks: file: configuration: {
 		required: false
 		type: string: examples: ["/var/log/vector"]
 	}
+	batch: {
+		description: """
+			Event batching behavior.
+
+			This is only applied when `batch_encoding` is set. The default per-event
+			streaming path writes events to files as they arrive and does not batch.
+			"""
+		required: false
+		type: object: options: {
+			max_bytes: {
+				description: """
+					The maximum size of a batch that is processed by a sink.
+
+					This is based on the uncompressed size of the batched events, before they are
+					serialized or compressed.
+					"""
+				required: false
+				type: uint: {
+					default: 10000000
+					unit:    "bytes"
+				}
+			}
+			max_events: {
+				description: "The maximum size of a batch before it is flushed."
+				required:    false
+				type: uint: unit: "events"
+			}
+			timeout_secs: {
+				description: "The maximum age of a batch before it is flushed."
+				required:    false
+				type: float: {
+					default: 300.0
+					unit:    "seconds"
+				}
+			}
+		}
+	}
+	batch_encoding: {
+		description: """
+			Batch encoding configuration for columnar formats.
+
+			When set, events are batched together and encoded as a columnar format
+			(Parquet) instead of the standard per-event, framing-based encoding. The
+			columnar format handles its own internal compression, so the top-level
+			`compression` setting is ignored.
+
+			Because columnar files cannot be appended to, each batch is written to a
+			distinct file: a millisecond timestamp is inserted into the rendered `path`
+			before the file extension so that successive batches do not overwrite one
+			another.
+			"""
+		required: false
+		type: object: options: {
+			codec: {
+				description: """
+					Encodes events in [Apache Parquet][apache_parquet] columnar format.
+
+					[apache_parquet]: https://parquet.apache.org/
+					"""
+				required: true
+				type: string: enum: parquet: """
+					Encodes events in [Apache Parquet][apache_parquet] columnar format.
+
+					[apache_parquet]: https://parquet.apache.org/
+					"""
+			}
+			compression: {
+				description: "Compression codec applied per column page inside the Parquet file."
+				required:    false
+				type: object: options: {
+					algorithm: {
+						description: "Compression codec applied per column page inside the Parquet file."
+						required:    false
+						type: string: {
+							default: "snappy"
+							enum: {
+								gzip:   "Gzip compression. Level must be between 1 and 9."
+								lz4:    "LZ4 raw compression"
+								none:   "No compression"
+								snappy: "Snappy compression (no level)."
+								zstd:   "Zstd compression. Level must be between 1 and 21."
+							}
+						}
+					}
+					level: {
+						description:   "Compression level (1–21). This is the range Vector supports; higher values compress more but are slower."
+						relevant_when: "algorithm = \"zstd\" or algorithm = \"gzip\""
+						required:      true
+						type: uint: {}
+					}
+				}
+			}
+			schema_file: {
+				description: """
+					Path to a native Parquet schema file (`.schema`).
+
+					Required unless `schema_mode` is `auto_infer`. The file must contain a valid
+					Parquet message type definition.
+					"""
+				required: false
+				type: string: {}
+			}
+			schema_mode: {
+				description: "Controls how events with fields not present in the schema are handled."
+				required:    false
+				type: string: {
+					default: "relaxed"
+					enum: {
+						auto_infer: "Auto infer schema based on the batch. No schema file needed."
+						relaxed:    "Missing fields become null. Extra fields are silently dropped."
+						strict:     "Missing fields become null. Extra fields cause an error."
+					}
+				}
+			}
+		}
+	}
 	compression: {
 		description: "Compression configuration."
 		required:    false
@@ -590,7 +706,7 @@ generated: components: sinks: file: configuration: {
 		type: uint: {
 			default: 30
 			examples: [
-				600,
+				600
 			]
 			unit: "seconds"
 		}
